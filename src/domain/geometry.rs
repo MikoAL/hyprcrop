@@ -8,9 +8,11 @@
 //! | `monitor_origin` | Finds the minimum (x, y) across all monitors (multi-monitor origin) |
 //! | `logical_to_physical` | Converts logical pixel coordinates to physical pixels using a scale factor |
 //! | `clamp_crop` | Clamps a crop region so it does not exceed monitor boundaries |
+//! | `monitor_logical_size` | Logical monitor size from Hyprland's physical mode size, scale and transform |
+//! | `logical_rect_to_pixels` | Converts a logical rect into pixel space of an image rendered at a given scale |
 
 use crate::domain::error::{AppError, Result};
-use crate::domain::types::MonitorInfo;
+use crate::domain::types::{MonitorInfo, ScreenRect};
 
 /// Parse a slurp geometry string (`"X,Y WxH"`) into `(x, y, w, h)`.
 ///
@@ -83,6 +85,45 @@ pub fn clamp_crop(x: u32, y: u32, w: u32, h: u32, img_w: u32, img_h: u32) -> (u3
 pub fn logical_to_physical(logical: u32, scale: f64) -> u32 {
     // Use explicit floor to make the truncation semantics and HiDPI behavior clear.
     (f64::from(logical) * scale).floor() as u32
+}
+
+/// Logical size of a monitor from the values reported by `hyprctl monitors`.
+///
+/// Hyprland reports `width`/`height` as the mode size in physical pixels, before
+/// scaling and rotation. The logical size divides by `scale` and swaps the axes
+/// for odd `transform` values (90° / 270°, flipped or not).
+pub fn monitor_logical_size(width: i32, height: i32, scale: f64, transform: i32) -> (i32, i32) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let (w, h) = if transform.rem_euclid(2) == 1 {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    (
+        (f64::from(w) / scale).round() as i32,
+        (f64::from(h) / scale).round() as i32,
+    )
+}
+
+/// Convert a rect in logical space into pixel space of an image rendered at `scale`
+/// pixels per logical pixel (both relative to the same origin).
+///
+/// Edges are rounded independently, so adjacent rects stay adjacent and the
+/// result covers exactly the pixels the logical rect spans on screen.
+pub fn logical_rect_to_pixels(rect: ScreenRect, scale: f64) -> ScreenRect {
+    let px = |v: i32| (f64::from(v) * scale).round() as i32;
+    let (x0, y0) = (px(rect.x), px(rect.y));
+    let (x1, y1) = (px(rect.x + rect.w), px(rect.y + rect.h));
+    ScreenRect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +260,49 @@ mod tests {
 
         // 101 * 1.25 = 126.25 -> 126
         assert_eq!(logical_to_physical(101, 1.25), 126);
+    }
+
+    #[test]
+    fn test_monitor_logical_size() {
+        assert_eq!(monitor_logical_size(1920, 1080, 1.0, 0), (1920, 1080));
+        assert_eq!(monitor_logical_size(2560, 1600, 1.6, 0), (1600, 1000));
+        assert_eq!(monitor_logical_size(3840, 2160, 1.5, 0), (2560, 1440));
+        assert_eq!(monitor_logical_size(2880, 1800, 1.25, 0), (2304, 1440));
+        // 90° / 270° (and their flipped variants) swap the axes
+        assert_eq!(monitor_logical_size(1920, 1080, 1.0, 1), (1080, 1920));
+        assert_eq!(monitor_logical_size(2560, 1600, 1.6, 3), (1000, 1600));
+        assert_eq!(monitor_logical_size(1920, 1080, 1.0, 7), (1080, 1920));
+        assert_eq!(monitor_logical_size(1920, 1080, 1.0, 2), (1920, 1080));
+        // Nonsense scale falls back to 1
+        assert_eq!(monitor_logical_size(1920, 1080, 0.0, 0), (1920, 1080));
+    }
+
+    #[test]
+    fn test_logical_rect_to_pixels() {
+        let r = |x, y, w, h| ScreenRect { x, y, w, h };
+        // Scale 1 is the identity
+        assert_eq!(
+            logical_rect_to_pixels(r(10, 20, 30, 40), 1.0),
+            r(10, 20, 30, 40)
+        );
+        // Integer-aligned at 1.6
+        assert_eq!(
+            logical_rect_to_pixels(r(20, 15, 500, 150), 1.6),
+            r(32, 24, 800, 240)
+        );
+        // Edges rounded independently: 21*1.6=33.6->34, (21+503)*1.6=838.4->838
+        assert_eq!(
+            logical_rect_to_pixels(r(21, 17, 503, 151), 1.6),
+            r(34, 27, 804, 242)
+        );
+        // Adjacent logical rects stay adjacent in pixel space
+        let a = logical_rect_to_pixels(r(0, 0, 21, 10), 1.6);
+        let b = logical_rect_to_pixels(r(21, 0, 21, 10), 1.6);
+        assert_eq!(a.x + a.w, b.x);
+        // Whole 1600x1000 logical monitor at 1.6 is the full 2560x1600 frame
+        assert_eq!(
+            logical_rect_to_pixels(r(0, 0, 1600, 1000), 1.6),
+            r(0, 0, 2560, 1600)
+        );
     }
 }

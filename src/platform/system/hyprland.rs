@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::domain::constants::FREEZE_LAYER_NAMESPACE;
 use crate::domain::error::{AppError, Result};
+use crate::domain::geometry::monitor_logical_size;
 use crate::domain::types::{BorderStyle, LayerSurface, MonitorInfo, ScreenRect, WindowInfo};
 
 #[derive(Deserialize, Debug)]
@@ -13,8 +14,16 @@ use crate::domain::types::{BorderStyle, LayerSurface, MonitorInfo, ScreenRect, W
 pub struct HyprMonitor {
     pub x: i32,
     pub y: i32,
+    /// Mode width in **physical** pixels (not divided by `scale`).
     pub width: i32,
+    /// Mode height in **physical** pixels (not divided by `scale`).
     pub height: i32,
+    /// Output scale factor, e.g. `1.6`.
+    #[serde(default = "default_scale")]
+    pub scale: f64,
+    /// `wl_output` transform (0–7); odd values rotate the output by 90° or 270°.
+    #[serde(default)]
+    pub transform: i32,
     pub name: String,
     pub focused: bool,
     pub active_workspace: HyprWorkspace,
@@ -207,19 +216,31 @@ pub fn get_overlay_layers() -> Result<Vec<LayerSurface>> {
     Ok(parse_overlay_layers(monitors))
 }
 
+fn default_scale() -> f64 {
+    1.0
+}
+
+/// Convert `hyprctl monitors` entries into [`MonitorInfo`] with a **logical** rect.
+///
+/// Hyprland reports `x`/`y` in logical layout coordinates but `width`/`height` in
+/// physical pixels, so the size is divided by the scale (and swapped for rotated
+/// outputs) to put the whole rect in the same logical space as windows and slurp.
 pub fn parse_monitors(monitors: Vec<HyprMonitor>) -> Vec<MonitorInfo> {
     monitors
         .into_iter()
-        .map(|m| MonitorInfo {
-            rect: ScreenRect {
-                x: m.x,
-                y: m.y,
-                w: m.width,
-                h: m.height,
-            },
-            name: m.name,
-            focused: m.focused,
-            active_workspace_id: m.active_workspace.id,
+        .map(|m| {
+            let (w, h) = monitor_logical_size(m.width, m.height, m.scale, m.transform);
+            MonitorInfo {
+                rect: ScreenRect {
+                    x: m.x,
+                    y: m.y,
+                    w,
+                    h,
+                },
+                name: m.name,
+                focused: m.focused,
+                active_workspace_id: m.active_workspace.id,
+            }
         })
         .collect()
 }
@@ -281,6 +302,8 @@ mod tests {
             y: 0,
             width: 1920,
             height: 1080,
+            scale: 1.0,
+            transform: 0,
             name: "DP-1".to_string(),
             focused: true,
             active_workspace: HyprWorkspace { id: 1 },
@@ -292,6 +315,41 @@ mod tests {
         assert_eq!(parsed[0].rect.w, 1920);
         assert!(parsed[0].focused);
         assert_eq!(parsed[0].active_workspace_id, 1);
+    }
+
+    #[test]
+    fn test_monitor_parsing_scaled_is_logical() {
+        // `hyprctl -j monitors` reports width/height in physical pixels.
+        let json = r#"[{
+            "name": "eDP-1", "x": 0, "y": 0, "width": 2560, "height": 1600,
+            "scale": 1.60, "transform": 0, "focused": true,
+            "activeWorkspace": {"id": 1}
+        },{
+            "name": "DP-1", "x": 1600, "y": 0, "width": 1920, "height": 1080,
+            "scale": 1.00, "transform": 1, "focused": false,
+            "activeWorkspace": {"id": 2}
+        }]"#;
+        let monitors: Vec<HyprMonitor> = serde_json::from_str(json).unwrap();
+        let parsed = parse_monitors(monitors);
+        assert_eq!(
+            parsed[0].rect,
+            ScreenRect {
+                x: 0,
+                y: 0,
+                w: 1600,
+                h: 1000
+            }
+        );
+        // Landscape panel rotated by 90° (transform 1): logical size is portrait.
+        assert_eq!(
+            parsed[1].rect,
+            ScreenRect {
+                x: 1600,
+                y: 0,
+                w: 1080,
+                h: 1920
+            }
+        );
     }
 
     #[test]

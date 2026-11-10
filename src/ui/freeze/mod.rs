@@ -30,6 +30,7 @@ use std::{
 use crate::domain::config::Config;
 use crate::domain::constants::FREEZE_LAYER_NAMESPACE;
 use crate::domain::error::{AppError, Result};
+use crate::domain::geometry::logical_rect_to_pixels;
 use crate::domain::types::{BorderStyle, ScreenRect};
 use crate::platform::capture::screencopy;
 use crate::platform::capture::toplevel_export;
@@ -85,8 +86,10 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
     // Using one session guarantees the overlay images and the final-crop source are
     // from the same frame — two separate captures would differ in time, breaking
     // the "freeze" guarantee (user selects based on a different frame than what gets saved).
-    let (physical_per_monitor, full_rgba) =
+    let (physical_per_monitor, composite) =
         screencopy::capture_all_monitors_with_physical(&monitors)?;
+    let composite_scale = composite.scale;
+    let full_rgba = composite.image;
 
     let monitor_images: Vec<iced_image::Handle> = physical_per_monitor
         .into_iter()
@@ -198,15 +201,17 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
             Ok(out_path)
         }
         Some(Some(FreezeSelection::Region(r))) => {
-            // Translate global logical coordinates → image coordinates.
-            // The image origin is (min_x, min_y) in global logical space.
+            // Translate global logical coordinates → image pixel coordinates.
+            // The image origin is (min_x, min_y) in global logical space and the
+            // composite has `composite_scale` pixels per logical pixel.
             let adjusted = ScreenRect {
                 x: r.x - min_x,
                 y: r.y - min_y,
                 w: r.w,
                 h: r.h,
             };
-            screencopy::crop_and_save(full_rgba, Some(adjusted), &out_path)?;
+            let px = logical_rect_to_pixels(adjusted, composite_scale);
+            screencopy::crop_and_save(full_rgba, Some(px), &out_path)?;
             Ok(out_path)
         }
         Some(Some(FreezeSelection::ToplevelWindow(window))) => {
@@ -234,7 +239,8 @@ pub fn run_freeze(cfg: &Config) -> Result<PathBuf> {
                     h: window.rect.h,
                 }
                 .expand(border_style.border_size);
-                screencopy::crop_and_save(full_rgba, Some(adjusted), &out_path)?;
+                let px = logical_rect_to_pixels(adjusted, composite_scale);
+                screencopy::crop_and_save(full_rgba, Some(px), &out_path)?;
             }
             Ok(out_path)
         }

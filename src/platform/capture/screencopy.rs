@@ -369,29 +369,44 @@ pub fn capture_monitor(monitor_name: &str) -> Result<RgbaImage> {
 /// Type alias to reduce verbosity of per-monitor capture return types.
 pub type RgbaImage = ImageBuffer<Rgba<u8>, Vec<u8>>;
 
-/// Capture all monitors and composite them into a single image in **logical pixel space**.
+/// All monitors composited into one image.
 ///
-/// The output dimensions and pixel coordinates match what Hyprland IPC and slurp report,
-/// so crop coordinates can be applied directly without coordinate conversion.
-/// HiDPI monitors are downsampled to their logical size during compositing.
-pub fn capture_all_monitors(monitors: &[MonitorInfo]) -> Result<RgbaImage> {
+/// Pixel `(0, 0)` is the layout origin returned by
+/// [`monitor_origin`](crate::domain::geometry::monitor_origin), and one logical
+/// pixel spans `scale` image pixels. `scale` is the highest monitor scale, so the
+/// highest-DPI monitor keeps its native resolution (lower-DPI monitors are
+/// upsampled to match). Convert logical crop rects with
+/// [`logical_rect_to_pixels`](crate::domain::geometry::logical_rect_to_pixels).
+pub struct Composite {
+    pub image: RgbaImage,
+    pub scale: f64,
+}
+
+/// Capture all monitors and composite them into a single image (see [`Composite`]).
+pub fn capture_all_monitors(monitors: &[MonitorInfo]) -> Result<Composite> {
     Ok(capture_all_monitors_with_physical(monitors)?.1)
 }
 
 /// Capture all monitors in a **single Wayland session** and return:
 /// - Per-monitor physical-resolution images (in the same order as `monitors`)
-/// - Logical-space composite of all monitors (for crop operations)
+/// - A [`Composite`] of all monitors (for crop operations)
 ///
 /// Using one session ensures the overlay and the final crop originate from the
 /// same frame, which is critical for the freeze-mode "what you see is what you
 /// save" guarantee.
 pub fn capture_all_monitors_with_physical(
     monitors: &[MonitorInfo],
-) -> Result<(Vec<RgbaImage>, RgbaImage)> {
+) -> Result<(Vec<RgbaImage>, Composite)> {
     if monitors.is_empty() {
         return Err(AppError::Wayland(
             "No monitors provided to capture".to_string(),
         ));
+    }
+    if let Some(m) = monitors.iter().find(|m| m.rect.w <= 0 || m.rect.h <= 0) {
+        return Err(AppError::Wayland(format!(
+            "Monitor '{}' has invalid dimensions ({}x{}) in Hyprland IPC data",
+            m.name, m.rect.w, m.rect.h
+        )));
     }
 
     let names: Vec<&str> = monitors.iter().map(|m| m.name.as_str()).collect();
@@ -410,8 +425,27 @@ pub fn capture_all_monitors_with_physical(
             },
         );
 
-        let total_width = (max_x - min_x).max(0) as u32;
-        let total_height = (max_y - min_y).max(0) as u32;
+        // Physical pixels per logical pixel, taken from the captured frames so it is
+        // exact for what was copied. Area-based so it does not depend on whether a
+        // rotated output's frame is reported in rotated or unrotated orientation.
+        let scale = frames
+            .iter()
+            .filter_map(|fi| {
+                let m = monitors.iter().find(|m| m.name == fi.name)?;
+                let phys = f64::from(fi.width) * f64::from(fi.height);
+                let logical = f64::from(m.rect.w) * f64::from(m.rect.h);
+                Some((phys / logical).sqrt())
+            })
+            .fold(0.0_f64, f64::max);
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let to_px = |logical: i32| (f64::from(logical) * scale).round().max(0.0) as u32;
+
+        let total_width = to_px(max_x - min_x);
+        let total_height = to_px(max_y - min_y);
         let mut master_img = ImageBuffer::new(total_width, total_height);
 
         // Slot for per-monitor physical images, indexed by position in `monitors`.
@@ -438,42 +472,40 @@ pub fn capture_all_monitors_with_physical(
                 .format
                 .ok_or_else(|| AppError::Screencopy("format not set".to_string()))?;
 
-            // --- Logical-space composite ---
-            let offset_x = (mon_info.rect.x - min_x) as u32;
-            let offset_y = (mon_info.rect.y - min_y) as u32;
-            let log_w = mon_info.rect.w;
-            let log_h = mon_info.rect.h;
-
-            if log_w <= 0 || log_h <= 0 {
-                return Err(AppError::Wayland(format!(
-                    "Monitor '{}' has invalid dimensions ({}x{}) in Hyprland IPC data",
-                    mon_info.name, log_w, log_h
-                )));
+            // --- Composite at `scale` pixels per logical pixel ---
+            // Edges are rounded independently (like `logical_rect_to_pixels`) and
+            // clamped to the canvas so rounding can never write out of bounds.
+            let x0 = to_px(mon_info.rect.x - min_x).min(total_width);
+            let y0 = to_px(mon_info.rect.y - min_y).min(total_height);
+            let x1 = to_px(mon_info.rect.x + mon_info.rect.w - min_x).min(total_width);
+            let y1 = to_px(mon_info.rect.y + mon_info.rect.h - min_y).min(total_height);
+            let (dst_w, dst_h) = (x1 - x0, y1 - y0);
+            if dst_w == 0 || dst_h == 0 || fi.width == 0 || fi.height == 0 {
+                continue;
             }
-            let log_w = log_w as u32;
-            let log_h = log_h as u32;
 
-            // Pre-compute the logical→physical index mapping for each axis.
-            let phys_xs: Vec<u32> = (0..log_w)
-                .map(|lx| {
-                    ((lx as u64 * fi.width as u64 / log_w as u64) as u32)
+            // Pre-compute the composite→physical index mapping for each axis
+            // (identity when the monitor's scale equals the composite scale).
+            let phys_xs: Vec<u32> = (0..dst_w)
+                .map(|dx| {
+                    ((dx as u64 * fi.width as u64 / dst_w as u64) as u32)
                         .min(fi.width.saturating_sub(1))
                 })
                 .collect();
-            let phys_ys: Vec<u32> = (0..log_h)
-                .map(|ly| {
-                    ((ly as u64 * fi.height as u64 / log_h as u64) as u32)
+            let phys_ys: Vec<u32> = (0..dst_h)
+                .map(|dy| {
+                    ((dy as u64 * fi.height as u64 / dst_h as u64) as u32)
                         .min(fi.height.saturating_sub(1))
                 })
                 .collect();
 
-            for (ly, &py) in phys_ys.iter().enumerate() {
+            for (dy, &py) in phys_ys.iter().enumerate() {
                 let row_offset = py as usize * fi.stride as usize;
-                for (lx, &px) in phys_xs.iter().enumerate() {
+                for (dx, &px) in phys_xs.iter().enumerate() {
                     let offset = row_offset + px as usize * 4;
                     master_img.put_pixel(
-                        offset_x + lx as u32,
-                        offset_y + ly as u32,
+                        x0 + dx as u32,
+                        y0 + dy as u32,
                         wl_shared::read_pixel_rgba(mmap, offset, format),
                     );
                 }
@@ -493,7 +525,13 @@ pub fn capture_all_monitors_with_physical(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok((physical_images, master_img))
+        Ok((
+            physical_images,
+            Composite {
+                image: master_img,
+                scale,
+            },
+        ))
     })
 }
 

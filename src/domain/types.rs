@@ -13,7 +13,7 @@
 
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct ScreenRect {
     pub x: i32,
     pub y: i32,

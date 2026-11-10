@@ -6,7 +6,7 @@ use std::{
 use crate::domain::config::Config;
 use crate::domain::error::{AppError, Result};
 use crate::domain::geometry::{
-    clamp_crop, logical_to_physical, monitor_origin, parse_slurp_geometry,
+    clamp_crop, logical_rect_to_pixels, logical_to_physical, monitor_origin, parse_slurp_geometry,
 };
 use crate::domain::types::ScreenRect;
 use crate::platform::capture::{screencopy, toplevel_export};
@@ -51,23 +51,36 @@ pub fn capture_crop(cfg: &Config) -> Result<PathBuf> {
 
     // capture_all_monitors places (min_x, min_y) at image pixel (0, 0).
     // Slurp returns global logical coordinates, so we must subtract the origin
-    // to get image-space coordinates. This matters for multi-monitor layouts
-    // where some monitors sit at negative logical positions.
+    // to get composite-relative coordinates, then scale them into image pixels.
+    // The origin matters for multi-monitor layouts where some monitors sit at
+    // negative logical positions; the scale matters on HiDPI monitors.
     let (min_x, min_y) = monitor_origin(&monitors);
-    let x = (slurp_x - min_x).max(0) as u32;
-    let y = (slurp_y - min_y).max(0) as u32;
+
+    let composite = screencopy::capture_all_monitors(&monitors)?;
+    let full_img = composite.image;
+
+    let px = logical_rect_to_pixels(
+        ScreenRect {
+            x: slurp_x - min_x,
+            y: slurp_y - min_y,
+            w: req_w as i32,
+            h: req_h as i32,
+        },
+        composite.scale,
+    );
+    let x = px.x.max(0) as u32;
+    let y = px.y.max(0) as u32;
+    let (px_w, px_h) = (px.w.max(0) as u32, px.h.max(0) as u32);
     if slurp_x < min_x || slurp_y < min_y {
         eprintln!(
-            "warning: crop origin ({slurp_x},{slurp_y}) is before monitor origin ({min_x},{min_y}), clamped to ({x},{y})"
+            "warning: crop origin ({slurp_x},{slurp_y}) is before monitor origin ({min_x},{min_y}), clamped to pixel ({x},{y})"
         );
     }
 
-    let full_img = screencopy::capture_all_monitors(&monitors)?;
-
-    let (w, h, was_clamped) = clamp_crop(x, y, req_w, req_h, full_img.width(), full_img.height());
+    let (w, h, was_clamped) = clamp_crop(x, y, px_w, px_h, full_img.width(), full_img.height());
     if was_clamped {
         eprintln!(
-            "warning: crop region ({slurp_x},{slurp_y} {req_w}x{req_h}) exceeds image bounds ({}x{}), clamped to {w}x{h}",
+            "warning: crop region ({slurp_x},{slurp_y} {req_w}x{req_h}) is {px_w}x{px_h} px at ({x},{y}), exceeding image bounds ({}x{}); clamped to {w}x{h}",
             full_img.width(),
             full_img.height(),
         );
@@ -203,7 +216,7 @@ pub fn capture_portal(cfg: &Config) -> Result<PathBuf> {
 
 pub fn capture_all(cfg: &Config) -> Result<PathBuf> {
     let monitors = hyprland::parse_monitors(hyprland::get_monitors()?);
-    let img = screencopy::capture_all_monitors(&monitors)?;
+    let img = screencopy::capture_all_monitors(&monitors)?.image;
 
     let path = cfg.output_path();
     img.save(&path).map_err(AppError::from)?;
